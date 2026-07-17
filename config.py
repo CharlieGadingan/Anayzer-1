@@ -12,3 +12,4 @@ class Config:
     
     # Other settings
     DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+    COMPILE_TIMEOUT = int(os.getenv('COMPILE_TIMEOUT', 30))

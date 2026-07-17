@@ -14,6 +14,12 @@ from git import Repo
 import socket
 import sys
 import requests
+from language_support import (
+    SUPPORTED_EXTENSIONS,
+    SUPPORTED_LANGUAGES,
+    analyze_syntax,
+    detect_language,
+)
 
 load_dotenv()
 
@@ -35,114 +41,9 @@ CORS(app, origins=[
 # In-memory storage for analysis results (since no Firebase)
 analysis_storage = {}
 
-def clean_error_message(error_line):
-    """Extract error message from compiler output"""
-    import re
-    
-    # Try to extract the main error with line number
-    main_error = re.search(r':(\d+):(\d+):\s+(error|warning):\s+(.*)$', error_line, re.IGNORECASE)
-    if main_error:
-        line_num = int(main_error.group(1))
-        msg_type = main_error.group(3).lower()
-        message = main_error.group(4).strip()
-        message = re.sub(r'\s*\[.*?\]$', '', message).strip()
-        
-        return {
-            'line': line_num,
-            'type': msg_type,
-            'message': message
-        }
-    
-    # Try without column number
-    simple_error = re.search(r':(\d+):\s+(error|warning):\s+(.*)$', error_line, re.IGNORECASE)
-    if simple_error:
-        line_num = int(simple_error.group(1))
-        msg_type = simple_error.group(2).lower()
-        message = simple_error.group(3).strip()
-        message = re.sub(r'\s*\[.*?\]$', '', message).strip()
-        
-        return {
-            'line': line_num,
-            'type': msg_type,
-            'message': message
-        }
-    
-    # Last resort - extract error without line number
-    if 'error:' in error_line.lower():
-        parts = error_line.lower().split('error:')
-        return {
-            'line': 0,
-            'type': 'error',
-            'message': parts[-1].strip()
-        }
-    elif 'warning:' in error_line.lower():
-        parts = error_line.lower().split('warning:')
-        return {
-            'line': 0,
-            'type': 'warning',
-            'message': parts[-1].strip()
-        }
-    
-    return None
-
-def analyze_file(file_path, language):
-    """Analyze a single C/C++ file"""
-    errors = []
-    warnings = []
-    
-    try:
-        if language == 'c':
-            cmd = ['gcc', '-fsyntax-only', '-Wall', '-Wextra', '-std=c11', file_path]
-        elif language == 'cpp':
-            cmd = ['g++', '-fsyntax-only', '-Wall', '-Wextra', '-std=c++14', file_path]
-        else:
-            return errors, warnings
-        
-        # Run compilation
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        # Parse ALL errors and warnings from stderr
-        seen_messages = set()
-        
-        for line in process.stderr.split('\n'):
-            if not line.strip():
-                continue
-            
-            cleaned = clean_error_message(line)
-            if cleaned is None:
-                continue
-            
-            # Create unique key for this message
-            msg_key = f"{cleaned['line']}:{cleaned['type']}:{cleaned['message']}"
-            if msg_key in seen_messages:
-                continue
-            
-            seen_messages.add(msg_key)
-            
-            if cleaned['type'] == 'error':
-                errors.append({
-                    'line': cleaned['line'],
-                    'message': cleaned['message'],
-                    'type': 'error'
-                })
-            elif cleaned['type'] == 'warning':
-                warnings.append({
-                    'line': cleaned['line'],
-                    'message': cleaned['message'],
-                    'type': 'warning'
-                })
-        
-        # Sort by line number
-        errors.sort(key=lambda x: x['line'])
-        warnings.sort(key=lambda x: x['line'])
-        
-    except subprocess.TimeoutExpired:
-        errors.append({'line': 0, 'message': 'Compilation timeout - file may be too complex', 'type': 'error'})
-    except FileNotFoundError:
-        errors.append({'line': 0, 'message': f'Compiler not found. Please install {"gcc" if language=="c" else "g++"}.', 'type': 'error'})
-    except Exception as e:
-        errors.append({'line': 0, 'message': f'Analysis error: {str(e)}', 'type': 'error'})
-    
+def analyze_file(file_path, language, repo_root=None):
+    """Analyze a single source file."""
+    errors, warnings, _ = analyze_syntax(file_path, language, repo_root=repo_root)
     return errors, warnings
 
 def detect_branch(repo_url):
@@ -204,9 +105,8 @@ def analyze_repository_background(analysis_id, repo_url, branch):
         analysis_storage[analysis_id]['status'] = 'analyzing'
         analysis_storage[analysis_id]['branch_used'] = used_branch
         
-        # Find C/C++ files
-        cpp_files = []
-        extensions = ['.c', '.cpp', '.cc', '.cxx', '.c++', '.h', '.hpp']
+        # Find supported source files
+        source_files = []
         
         for root, dirs, files in os.walk(temp_dir):
             dirs[:] = [d for d in dirs if not d.startswith('.') and d != '.git' and d != '__pycache__']
@@ -214,15 +114,14 @@ def analyze_repository_background(analysis_id, repo_url, branch):
             for file in files:
                 file_path = os.path.join(root, file)
                 rel_path = os.path.relpath(file_path, temp_dir)
-                ext = os.path.splitext(file)[1].lower()
-                
-                if ext in extensions:
-                    language = 'c' if ext == '.c' else 'cpp'
-                    cpp_files.append((file_path, rel_path, language, file))
+
+                language = detect_language(file)
+                if language:
+                    source_files.append((file_path, rel_path, language, file))
         
-        print(f"🔍 Found {len(cpp_files)} C/C++ files")
+        print(f"🔍 Found {len(source_files)} supported source files")
         
-        if len(cpp_files) == 0:
+        if len(source_files) == 0:
             analysis_storage[analysis_id]['status'] = 'completed'
             analysis_storage[analysis_id]['summary'] = {
                 'total_files': 0,
@@ -237,7 +136,7 @@ def analyze_repository_background(analysis_id, repo_url, branch):
         total_warnings = 0
         analyzed_files = []
         
-        for file_path, rel_path, language, file_name in cpp_files:
+        for file_path, rel_path, language, file_name in source_files:
             try:
                 # Read file content
                 content = ""
@@ -257,7 +156,7 @@ def analyze_repository_background(analysis_id, repo_url, branch):
                     content = f"// Error reading file: {str(e)}"
                 
                 # Analyze file
-                errors, warnings = analyze_file(file_path, language)
+                errors, warnings = analyze_file(file_path, language, repo_root=temp_dir)
                 
                 file_result = {
                     'file_path': rel_path.replace('\\', '/'),
@@ -302,7 +201,7 @@ def analyze_repository_background(analysis_id, repo_url, branch):
         # Store results
         analysis_storage[analysis_id]['status'] = 'completed'
         analysis_storage[analysis_id]['summary'] = {
-            'total_files': len(cpp_files),
+            'total_files': len(source_files),
             'errors_count': total_errors,
             'warnings_count': total_warnings,
             'branch_used': used_branch
@@ -310,7 +209,7 @@ def analyze_repository_background(analysis_id, repo_url, branch):
         analysis_storage[analysis_id]['files'] = analyzed_files
         
         print(f"\n✅ Analysis complete for {analysis_id}")
-        print(f"   Total files: {len(cpp_files)}")
+        print(f"   Total files: {len(source_files)}")
         print(f"   Total errors: {total_errors}")
         print(f"   Total warnings: {total_warnings}")
         
@@ -417,8 +316,8 @@ def home():
             'GET /api/analysis/<analysis_id> - Get analysis results',
             'GET /api/health - Health check'
         ],
-        'supported_languages': ['C', 'C++'],
-        'supported_extensions': ['.c', '.cpp', '.cc', '.cxx', '.c++', '.h', '.hpp']
+        'supported_languages': SUPPORTED_LANGUAGES,
+        'supported_extensions': SUPPORTED_EXTENSIONS
     })
 
 def find_free_port():
