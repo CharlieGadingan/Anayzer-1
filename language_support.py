@@ -83,6 +83,12 @@ def build_analysis_command(language, file_path, repo_root=None):
     if language == 'java':
         output_dir = tempfile.mkdtemp(prefix='java-syntax-')
         cleanup_paths.append(output_dir)
+        source_files = _collect_java_sources(file_path, repo_root)
+        source_list_path = os.path.join(output_dir, 'sources.txt')
+        with open(source_list_path, 'w', encoding='utf-8') as source_list:
+            for source_file in source_files:
+                source_list.write(_format_javac_argfile_path(source_file) + '\n')
+
         source_root = repo_root or os.path.dirname(file_path)
         return [
             'javac',
@@ -90,7 +96,7 @@ def build_analysis_command(language, file_path, repo_root=None):
             '-Xlint:all',
             '-d', output_dir,
             '-sourcepath', source_root,
-            file_path
+            f'@{source_list_path}'
         ], cleanup_paths
 
     if language == 'javascript':
@@ -146,6 +152,41 @@ def build_analysis_command(language, file_path, repo_root=None):
     raise ValueError(f'Unsupported language: {language}')
 
 
+def _collect_java_sources(file_path, repo_root=None):
+    if not repo_root or not os.path.isdir(repo_root):
+        return [os.path.abspath(file_path)]
+
+    ignored_dirs = {
+        '.git',
+        '.gradle',
+        '.idea',
+        '.mvn',
+        'build',
+        'dist',
+        'node_modules',
+        'out',
+        'target',
+    }
+    source_files = []
+
+    for root, dirs, files in os.walk(repo_root):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ignored_dirs]
+        for name in files:
+            if name.lower().endswith('.java'):
+                source_files.append(os.path.abspath(os.path.join(root, name)))
+
+    target_path = os.path.abspath(file_path)
+    if target_path not in source_files:
+        source_files.append(target_path)
+
+    return sorted(source_files)
+
+
+def _format_javac_argfile_path(path):
+    normalized_path = os.path.abspath(path)
+    return '"' + normalized_path.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
 _STANDARD_DIAGNOSTIC_RE = re.compile(
     r'^(.*?):(\d+)(?::(\d+))?:\s+(fatal error|error|warning):\s+(.*)$',
     re.IGNORECASE
@@ -168,7 +209,16 @@ def _add_diagnostic(errors, warnings, kind, line, message):
         errors.append(entry)
 
 
-def _parse_standard_output(output):
+def _same_source_path(diagnostic_path, source_path):
+    if not diagnostic_path or not source_path:
+        return True
+
+    normalized_diagnostic = os.path.normcase(os.path.abspath(diagnostic_path))
+    normalized_source = os.path.normcase(os.path.abspath(source_path))
+    return normalized_diagnostic == normalized_source
+
+
+def _parse_standard_output(output, source_path=None):
     errors = []
     warnings = []
     seen = set()
@@ -176,6 +226,9 @@ def _parse_standard_output(output):
     for line in output.splitlines():
         match = _STANDARD_DIAGNOSTIC_RE.match(line.strip())
         if not match:
+            continue
+
+        if source_path and not _same_source_path(match.group(1), source_path):
             continue
 
         line_num = int(match.group(2))
@@ -267,8 +320,10 @@ def parse_diagnostics(language, output, file_path):
     if not output.strip():
         return [], []
 
-    if language in {'c', 'cpp', 'java'}:
+    if language in {'c', 'cpp'}:
         return _parse_standard_output(output)
+    if language == 'java':
+        return _parse_standard_output(output, file_path)
     if language == 'csharp':
         return _parse_csharp_output(output)
     if language == 'javascript':
