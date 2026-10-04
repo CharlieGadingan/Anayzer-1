@@ -47,11 +47,35 @@ EXTENSION_TO_LANGUAGE = _build_extension_map()
 SUPPORTED_LANGUAGES = [spec['label'] for spec in LANGUAGE_SPECS.values()]
 SUPPORTED_EXTENSIONS = sorted({ext for spec in LANGUAGE_SPECS.values() for ext in spec['extensions']})
 
+# Values accepted by the API in addition to the internal language keys.  Keeping
+# these in one place makes clients free to use either common display names or
+# the filename extension to select a compiler.
+LANGUAGE_ALIASES = {
+    'c': 'c',
+    'clanguage': 'c',
+    'c language': 'c',
+    'cpp': 'cpp',
+    'c++': 'cpp',
+    'cplusplus': 'cpp',
+    'c plus plus': 'cpp',
+    'java': 'java',
+    'python': 'python',
+    'py': 'python',
+}
+
 
 def detect_language(file_name):
     """Return the internal language key for a filename, or None if unsupported."""
     extension = os.path.splitext(file_name)[1].lower()
     return EXTENSION_TO_LANGUAGE.get(extension)
+
+
+def normalize_language(language):
+    """Convert an API language value such as ``Cpp`` to an internal key."""
+    if not isinstance(language, str):
+        return None
+    normalized = language.strip().lower()
+    return LANGUAGE_ALIASES.get(normalized)
 
 
 def get_missing_tool_hint(language):
@@ -423,3 +447,57 @@ def analyze_syntax(file_path, language, repo_root=None, timeout=30):
                     pass
 
     return errors, warnings, compile_output
+
+
+def compile_source(source, language=None, filename=None, timeout=30):
+    """Compile/check a source string without executing it.
+
+    The returned payload is deliberately compiler-neutral so the HTTP API can
+    expose the same response shape for C, C++, Java, and Python.
+    """
+    if not isinstance(source, str):
+        raise ValueError('Source code must be a string.')
+    if filename is not None and not isinstance(filename, str):
+        raise ValueError('Filename must be a string.')
+
+    if len(source.encode('utf-8')) > 1_000_000:
+        raise ValueError('Source code exceeds the 1 MB limit.')
+
+    detected = detect_language(filename or '')
+    normalized_language = normalize_language(language) if language else detected
+    if not normalized_language:
+        raise ValueError('Choose one of: Java, Python, Cpp, or CLanguage.')
+
+    if detected and detected != normalized_language:
+        raise ValueError('Filename extension does not match the selected language.')
+
+    extension = LANGUAGE_SPECS[normalized_language]['extensions'][0]
+    safe_name = os.path.basename(filename or f'Main{extension}')
+    if detect_language(safe_name) not in {None, normalized_language}:
+        raise ValueError('Filename extension does not match the selected language.')
+    if not os.path.splitext(safe_name)[1]:
+        safe_name = f'{safe_name}{extension}'
+
+    workspace = tempfile.mkdtemp(prefix='code-compile-')
+    source_path = os.path.join(workspace, safe_name)
+    try:
+        with open(source_path, 'w', encoding='utf-8', newline='') as source_file:
+            source_file.write(source)
+
+        errors, warnings, output = analyze_syntax(
+            source_path,
+            normalized_language,
+            repo_root=workspace,
+            timeout=timeout,
+        )
+        return {
+            'language': normalized_language,
+            'filename': safe_name,
+            'success': not errors,
+            'errors': errors,
+            'warnings': warnings,
+            'compile_output': output,
+        }
+    finally:
+        import shutil
+        shutil.rmtree(workspace, ignore_errors=True)

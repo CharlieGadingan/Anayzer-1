@@ -18,6 +18,7 @@ from language_support import (
     SUPPORTED_EXTENSIONS,
     SUPPORTED_LANGUAGES,
     analyze_syntax,
+    compile_source,
     detect_language,
 )
 
@@ -268,6 +269,38 @@ def analyze_repository():
         print(f"❌ Error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
+@app.route('/api/compile', methods=['POST'])
+def compile_code():
+    """Compile source supplied by a client without running the program.
+
+    Supported values for ``language`` are Java, Python, Cpp/C++, and
+    CLanguage/C. A filename is optional, but recommended for Java sources with
+    a public class declaration.
+    """
+    data = request.get_json(silent=True) or {}
+    source = data.get('source', data.get('code'))
+
+    if source is None:
+        return jsonify({
+            'success': False,
+            'error': 'Source code is required in the source (or code) field.'
+        }), 400
+
+    try:
+        result = compile_source(
+            source=source,
+            language=data.get('language'),
+            filename=data.get('filename'),
+            timeout=min(int(os.getenv('COMPILE_TIMEOUT', 30)), 30),
+        )
+        return jsonify(result), 200
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        print(f'Compilation error: {exc}')
+        return jsonify({'success': False, 'error': 'Unable to compile source.'}), 500
+
 @app.route('/api/analysis/<analysis_id>', methods=['GET'])
 def get_analysis(analysis_id):
     """Get analysis results"""
@@ -313,6 +346,7 @@ def home():
         'status': 'running',
         'endpoints': [
             'POST /api/analyze - Analyze a GitHub repository',
+            'POST /api/compile - Compile Java, Python, C++, or C source',
             'GET /api/analysis/<analysis_id> - Get analysis results',
             'GET /api/health - Health check'
         ],
